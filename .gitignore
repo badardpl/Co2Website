@@ -1,0 +1,14 @@
+# Streamlit secrets — NEVER commit real credentials
+.streamlit/secrets.toml
+
+# AWS credentials
+.aws/
+*.pem
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
+.venv/
