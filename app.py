@@ -1,19 +1,17 @@
 """
-CO₂ Sensor Dashboard — Streamlit
-=================================
-Updated with all latest improvements:
-  - Zero / invalid readings filtered out automatically
-  - Dynamic Y-axis min floored at 300 ppm (not hard-coded)
-  - Distinct zone colours: Good (green) · Moderate (yellow) · Elevated (burnt-orange) · High (deep crimson)
-  - Per-day sections when data spans multiple days
-  - Office-hours pie chart (10 AM – 10 PM) + Non-office-hours pie chart per day
-  - Sidebar controls: configurable office hours start/end
+CO₂ Sensor Dashboard — Streamlit  (Streamlit Cloud / deployed version)
+=======================================================================
+Credentials come from st.secrets (configured in Streamlit Cloud settings).
 
 Install:
     pip install streamlit boto3 pandas plotly
 
-Run:
-    streamlit run app.py
+Run locally (requires .streamlit/secrets.toml with [aws] section):
+    streamlit run app_cloud.py
+
+Deploy:
+    Push to GitHub, connect repo in Streamlit Cloud,
+    set secrets under App settings → Secrets.
 """
 
 import io
@@ -21,7 +19,6 @@ import time
 import boto3
 import pandas as pd
 import plotly.graph_objects as go
-import plotly.express as px
 import streamlit as st
 from datetime import datetime, timezone
 from boto3.dynamodb.conditions import Key
@@ -51,6 +48,8 @@ CARD_META = [
 PIE_COLORS = ["#27ae60", "#d4ac0d", "#d35400", "#7b0020"]
 PIE_LABELS = ["Good <800", "Moderate 800–1000", "Elevated 1000–1200", "High ≥1200"]
 
+MIN_DATE = pd.Timestamp("2026-05-05", tz="UTC")   # discard all data before this
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def classify(ppm: int) -> str:
     for lo, hi, label, *_ in ZONES:
@@ -72,10 +71,18 @@ def level_counts(df: pd.DataFrame) -> dict:
         "High":     int((df["co2_ppm"] >= 1200).sum()),
     }
 
+def parse_ts(ts_val) -> datetime:
+    ts = int(ts_val)
+    # Old data written by IoT Rule timestamp() is in milliseconds;
+    # new ESP32 data is Unix seconds. Distinguish by magnitude.
+    if ts > 10_000_000_000:
+        ts = ts // 1000
+    return datetime.fromtimestamp(ts, tz=timezone.utc)
+
 # ── Data ──────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=0)
 def fetch_dynamodb() -> pd.DataFrame:
-    ddb   = boto3.resource(
+    ddb = boto3.resource(
         "dynamodb",
         region_name=REGION,
         aws_access_key_id=st.secrets["aws"]["access_key_id"],
@@ -91,7 +98,7 @@ def fetch_dynamodb() -> pd.DataFrame:
             break
         kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
     rows = [
-        {"timestamp_utc": datetime.fromtimestamp(int(r["ts"]) / 1000, tz=timezone.utc),
+        {"timestamp_utc": parse_ts(r["ts"]),
          "co2_ppm":       int(r.get("co2_ppm", 0))}
         for r in items
     ]
@@ -115,7 +122,6 @@ def line_chart(day_df: pd.DataFrame, tz_offset: int) -> go.Figure:
 
     fig = go.Figure()
 
-    # Coloured background zones
     for lo, hi, label, color, fill in ZONES:
         y0 = max(lo, y_min)
         y1 = min(hi, y_max)
@@ -129,7 +135,6 @@ def line_chart(day_df: pd.DataFrame, tz_offset: int) -> go.Figure:
             annotation=dict(font_size=10, font_color=color),
         )
 
-    # Dashed zone boundary lines
     for boundary in [800, 1000, 1200]:
         if y_min < boundary < y_max:
             fig.add_hline(
@@ -137,7 +142,6 @@ def line_chart(day_df: pd.DataFrame, tz_offset: int) -> go.Figure:
                 line=dict(color="rgba(0,0,0,0.15)", width=1, dash="dot"),
             )
 
-    # Data line
     fig.add_trace(go.Scatter(
         x=loc,
         y=day_df["co2_ppm"],
@@ -158,12 +162,8 @@ def line_chart(day_df: pd.DataFrame, tz_offset: int) -> go.Figure:
         plot_bgcolor="white",
         showlegend=False,
         xaxis=dict(showgrid=True, gridcolor="#f0f0f0"),
-        yaxis=dict(
-            showgrid=True,
-            gridcolor="#f0f0f0",
-            ticksuffix=" ppm",
-            range=[y_min, y_max],
-        ),
+        yaxis=dict(showgrid=True, gridcolor="#f0f0f0",
+                   ticksuffix=" ppm", range=[y_min, y_max]),
     )
     return fig
 
@@ -179,8 +179,7 @@ def bar_chart(counts: dict) -> go.Figure:
     fig.update_layout(
         height=260,
         margin=dict(l=0, r=0, t=10, b=0),
-        paper_bgcolor="white",
-        plot_bgcolor="white",
+        paper_bgcolor="white", plot_bgcolor="white",
         showlegend=False,
         xaxis=dict(showgrid=False),
         yaxis=dict(showgrid=True, gridcolor="#f0f0f0"),
@@ -193,16 +192,12 @@ def pie_chart(counts: dict, title: str) -> go.Figure:
 
     if total == 0:
         fig = go.Figure(go.Pie(
-            labels=["No data"],
-            values=[1],
-            marker_colors=["#e0e0e0"],
-            textinfo="label",
-            hoverinfo="skip",
+            labels=["No data"], values=[1],
+            marker_colors=["#e0e0e0"], textinfo="label", hoverinfo="skip",
         ))
     else:
         fig = go.Figure(go.Pie(
-            labels=PIE_LABELS,
-            values=values,
+            labels=PIE_LABELS, values=values,
             marker=dict(colors=PIE_COLORS, line=dict(color="white", width=2)),
             textinfo="percent",
             hovertemplate="%{label}<br><b>%{value} readings</b> (%{percent})<extra></extra>",
@@ -214,12 +209,8 @@ def pie_chart(counts: dict, title: str) -> go.Figure:
         margin=dict(l=0, r=0, t=36, b=0),
         paper_bgcolor="white",
         showlegend=True,
-        legend=dict(
-            orientation="h",
-            yanchor="bottom", y=-0.35,
-            xanchor="center", x=0.5,
-            font=dict(size=10),
-        ),
+        legend=dict(orientation="h", yanchor="bottom", y=-0.35,
+                    xanchor="center", x=0.5, font=dict(size=10)),
     )
     return fig
 
@@ -300,13 +291,12 @@ if df.empty:
     st.warning("No data found.")
     st.stop()
 
-# Filter zeros/invalid
 df, removed = filter_invalid(df)
+df = df[df["timestamp_utc"] >= MIN_DATE].reset_index(drop=True)
 if df.empty:
     st.warning("All readings were zero or invalid.")
     st.stop()
 
-# Localise timestamps and split by day
 df["ts_local"]   = df["timestamp_utc"] + pd.Timedelta(hours=tz_offset)
 df["date_local"] = df["ts_local"].dt.date
 days             = sorted(df["date_local"].unique())
@@ -341,7 +331,6 @@ for day_date in days:
     counts    = level_counts(day_df)
     pcts      = {k: round(v / total * 100) if total else 0 for k, v in counts.items()}
 
-    # Office / non-office split
     hour          = day_df["ts_local"].dt.hour
     office_df     = day_df[(hour >= office_start) & (hour < office_end)]
     non_office_df = day_df[(hour < office_start)  | (hour >= office_end)]
@@ -350,7 +339,6 @@ for day_date in days:
     oc_total      = sum(oc.values())
     noc_total     = sum(noc.values())
 
-    # ── Day heading ──────────────────────────────────────────────────────────
     st.markdown(
         f'<div class="day-divider">'
         f'<h2 style="margin:0;font-size:1.15rem;font-weight:700;">'
@@ -363,7 +351,6 @@ for day_date in days:
         unsafe_allow_html=True,
     )
 
-    # ── Metrics ──────────────────────────────────────────────────────────────
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Average CO₂",   f"{mean_ppm} ppm")
     c2.metric("Peak CO₂",
@@ -378,12 +365,10 @@ for day_date in days:
 
     st.write("")
 
-    # ── Line chart ────────────────────────────────────────────────────────────
     st.subheader("CO₂ Trend Over Time")
     st.plotly_chart(line_chart(day_df, tz_offset), use_container_width=True,
                     key=f"line_{day_date}")
 
-    # ── Level cards + bar chart ───────────────────────────────────────────────
     col_l, col_r = st.columns(2)
     with col_l:
         st.subheader("Air Quality Level Breakdown")
@@ -397,22 +382,18 @@ for day_date in days:
         st.plotly_chart(bar_chart(counts), use_container_width=True,
                         key=f"bar_{day_date}")
 
-    # ── Pie charts ────────────────────────────────────────────────────────────
     pie_l, pie_r = st.columns(2)
     with pie_l:
         st.plotly_chart(
-            pie_chart(oc,  f"☀️ Office Hours  ({office_start:02d}:00–{office_end:02d}:00)  ·  {oc_total} readings"),
-            use_container_width=True,
-            key=f"pie_office_{day_date}",
+            pie_chart(oc, f"☀️ Office Hours  ({office_start:02d}:00–{office_end:02d}:00)  ·  {oc_total} readings"),
+            use_container_width=True, key=f"pie_office_{day_date}",
         )
     with pie_r:
         st.plotly_chart(
             pie_chart(noc, f"🌙 Non-Office Hours  ·  {noc_total} readings"),
-            use_container_width=True,
-            key=f"pie_non_{day_date}",
+            use_container_width=True, key=f"pie_non_{day_date}",
         )
 
-    # ── Raw data expander ─────────────────────────────────────────────────────
     with st.expander("Show raw data for this day"):
         st.dataframe(
             day_df[["ts_local", "co2_ppm"]].rename(
@@ -423,7 +404,7 @@ for day_date in days:
 
     st.divider()
 
-# ── Download (all data) ───────────────────────────────────────────────────────
+# ── Download ──────────────────────────────────────────────────────────────────
 buf = io.StringIO()
 df[["ts_local", "co2_ppm"]].rename(
     columns={"ts_local": "timestamp_local", "co2_ppm": "co2_ppm"}
