@@ -38,17 +38,10 @@ ZONES = [
     (1200, 99999,"High",     "#7b0020", "rgba(100,0,20,0.18)"),
 ]
 
-CARD_META = [
-    ("Good",     "< 800 ppm",       "#edfaf3", "#27ae60"),
-    ("Moderate", "800 – 1000 ppm",  "#fefce8", "#d4ac0d"),
-    ("Elevated", "1000 – 1200 ppm", "#fff3e8", "#d35400"),
-    ("High",     "≥ 1200 ppm",      "#fdf0f0", "#7b0020"),
-]
-
 PIE_COLORS = ["#27ae60", "#d4ac0d", "#d35400", "#7b0020"]
 PIE_LABELS = ["Good <800", "Moderate 800–1000", "Elevated 1000–1200", "High ≥1200"]
 
-MIN_DATE = pd.Timestamp("2026-05-05", tz="UTC")   # discard all data before this
+MIN_DATE = pd.Timestamp("2026-05-05", tz="UTC")
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def classify(ppm: int) -> str:
@@ -57,11 +50,14 @@ def classify(ppm: int) -> str:
             return label
     return "High"
 
-def dot_color(ppm: int) -> str:
+def zone_color(ppm: int) -> str:
     for lo, hi, _, color, *_ in ZONES:
         if lo <= ppm < hi:
             return color
     return "#7b0020"
+
+def dot_color(ppm: int) -> str:
+    return zone_color(ppm)
 
 def level_counts(df: pd.DataFrame) -> dict:
     return {
@@ -73,14 +69,12 @@ def level_counts(df: pd.DataFrame) -> dict:
 
 def parse_ts(ts_val) -> datetime:
     ts = int(ts_val)
-    # Old data written by IoT Rule timestamp() is in milliseconds;
-    # new ESP32 data is Unix seconds. Distinguish by magnitude.
     if ts > 10_000_000_000:
         ts = ts // 1000
     return datetime.fromtimestamp(ts, tz=timezone.utc)
 
 # ── Data ──────────────────────────────────────────────────────────────────────
-@st.cache_data(ttl=0)
+@st.cache_data(ttl=None)
 def fetch_dynamodb() -> pd.DataFrame:
     ddb = boto3.resource(
         "dynamodb",
@@ -156,7 +150,7 @@ def line_chart(day_df: pd.DataFrame, tz_offset: int) -> go.Figure:
     ))
 
     fig.update_layout(
-        height=320,
+        height=340,
         margin=dict(l=0, r=80, t=10, b=0),
         paper_bgcolor="white",
         plot_bgcolor="white",
@@ -167,17 +161,121 @@ def line_chart(day_df: pd.DataFrame, tz_offset: int) -> go.Figure:
     )
     return fig
 
-def bar_chart(counts: dict) -> go.Figure:
+def pie_chart(counts: dict, title: str) -> go.Figure:
+    pairs  = [(l, c, v) for (l, c, v) in zip(PIE_LABELS, PIE_COLORS,
+               [counts["Good"], counts["Moderate"], counts["Elevated"], counts["High"]]) if v > 0]
+    total  = sum(v for *_, v in pairs)
+
+    if total == 0:
+        fig = go.Figure(go.Pie(
+            labels=["No data"], values=[1],
+            marker_colors=["#e0e0e0"], textinfo="label", hoverinfo="skip",
+        ))
+    else:
+        labels, colors, values = zip(*pairs)
+        fig = go.Figure(go.Pie(
+            labels=list(labels), values=list(values),
+            marker=dict(colors=list(colors), line=dict(color="white", width=2)),
+            textinfo="percent",
+            hole=0.55,
+            hovertemplate="%{label}<br><b>%{value} readings</b> (%{percent})<extra></extra>",
+        ))
+
+    fig.update_layout(
+        title=dict(text=title, font=dict(size=11), x=0, xanchor="left"),
+        height=160,
+        margin=dict(l=0, r=0, t=28, b=0),
+        paper_bgcolor="white",
+        showlegend=False,
+    )
+    return fig
+
+def analysis_pie_chart(counts: dict) -> go.Figure:
+    pairs = [(l, c, v) for (l, c, v) in zip(PIE_LABELS, PIE_COLORS,
+              [counts["Good"], counts["Moderate"], counts["Elevated"], counts["High"]]) if v > 0]
+    total = sum(v for *_, v in pairs)
+
+    if total == 0:
+        fig = go.Figure(go.Pie(labels=["No data"], values=[1],
+                               marker_colors=["#e0e0e0"], textinfo="label", hoverinfo="skip"))
+    else:
+        labels, colors, values = zip(*pairs)
+        fig = go.Figure(go.Pie(
+            labels=list(labels), values=list(values),
+            marker=dict(colors=list(colors), line=dict(color="white", width=2)),
+            textinfo="percent", hole=0.52,
+            hovertemplate="%{label}<br><b>%{value} readings</b> (%{percent})<extra></extra>",
+        ))
+    fig.update_layout(
+        height=280, margin=dict(l=0, r=0, t=10, b=0),
+        paper_bgcolor="white", showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=-0.35,
+                    xanchor="center", x=0.5, font=dict(size=10)),
+    )
+    return fig
+
+def analysis_line_chart(daily_avg: pd.Series) -> go.Figure:
+    vals  = daily_avg.values
+    y_min = max(300, (int(min(vals)) // 50) * 50 - 50)
+    y_max = (int(max(vals)) // 50) * 50 + 100
+
+    fig = go.Figure()
+
+    for lo, hi, label, color, fill in ZONES:
+        y0 = max(lo, y_min)
+        y1 = min(hi, y_max)
+        if y0 >= y1:
+            continue
+        fig.add_hrect(
+            y0=y0, y1=y1,
+            fillcolor=fill, line_width=0,
+            annotation_text=label,
+            annotation_position="right",
+            annotation=dict(font_size=10, font_color=color),
+        )
+
+    for boundary in [800, 1000, 1200]:
+        if y_min < boundary < y_max:
+            fig.add_hline(
+                y=boundary,
+                line=dict(color="rgba(0,0,0,0.15)", width=1, dash="dot"),
+            )
+
+    fig.add_trace(go.Scatter(
+        x=daily_avg.index.astype(str),
+        y=vals,
+        mode="lines+markers",
+        line=dict(color="#2c3e50", width=2),
+        marker=dict(
+            color=[dot_color(int(v)) for v in vals],
+            size=8,
+            line=dict(color="white", width=1.5),
+        ),
+        hovertemplate="%{x}<br><b>%{y} ppm</b><extra></extra>",
+    ))
+
+    fig.update_layout(
+        height=280,
+        margin=dict(l=0, r=80, t=10, b=0),
+        paper_bgcolor="white", plot_bgcolor="white",
+        showlegend=False,
+        xaxis=dict(showgrid=True, gridcolor="#f0f0f0"),
+        yaxis=dict(showgrid=True, gridcolor="#f0f0f0",
+                   ticksuffix=" ppm", range=[y_min, y_max]),
+    )
+    return fig
+
+def analysis_bar_chart(counts: dict) -> go.Figure:
     fig = go.Figure(go.Bar(
         x=["Good<br><800", "Moderate<br>800–1000",
            "Elevated<br>1000–1200", "High<br>≥1200"],
         y=[counts["Good"], counts["Moderate"], counts["Elevated"], counts["High"]],
-        marker_color=["#27ae60", "#d4ac0d", "#d35400", "#7b0020"],
+        marker_color=PIE_COLORS,
         marker_line_width=0,
         hovertemplate="%{y} readings<extra></extra>",
     ))
     fig.update_layout(
-        height=260,
+        height=280,
         margin=dict(l=0, r=0, t=10, b=0),
         paper_bgcolor="white", plot_bgcolor="white",
         showlegend=False,
@@ -186,42 +284,17 @@ def bar_chart(counts: dict) -> go.Figure:
     )
     return fig
 
-def pie_chart(counts: dict, title: str) -> go.Figure:
-    values = [counts["Good"], counts["Moderate"], counts["Elevated"], counts["High"]]
-    total  = sum(values)
-
-    if total == 0:
-        fig = go.Figure(go.Pie(
-            labels=["No data"], values=[1],
-            marker_colors=["#e0e0e0"], textinfo="label", hoverinfo="skip",
-        ))
-    else:
-        fig = go.Figure(go.Pie(
-            labels=PIE_LABELS, values=values,
-            marker=dict(colors=PIE_COLORS, line=dict(color="white", width=2)),
-            textinfo="percent",
-            hovertemplate="%{label}<br><b>%{value} readings</b> (%{percent})<extra></extra>",
-        ))
-
-    fig.update_layout(
-        title=dict(text=title, font=dict(size=12), x=0, xanchor="left"),
-        height=280,
-        margin=dict(l=0, r=0, t=36, b=0),
-        paper_bgcolor="white",
-        showlegend=True,
-        legend=dict(orientation="h", yanchor="bottom", y=-0.35,
-                    xanchor="center", x=0.5, font=dict(size=10)),
-    )
-    return fig
-
-def level_card_html(name, rng, count, pct, bg, border) -> str:
+# ── Bubble HTML ───────────────────────────────────────────────────────────────
+def bubble_html(value: int, label: str) -> str:
+    color  = zone_color(value)
+    bg     = color + "18"
+    border = color + "55"
     return f"""
-<div style="border-left:4px solid {border};border-radius:8px;
-            padding:12px 14px;background:{bg};margin-bottom:8px">
-  <div style="font-size:12px;font-weight:600;color:#444">{name}</div>
-  <div style="font-size:11px;color:#888;margin-bottom:6px">{rng}</div>
-  <div style="font-size:1.5rem;font-weight:700;color:{border}">{count}</div>
-  <div style="font-size:11px;color:#aaa">{pct}% of readings</div>
+<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;
+            width:72px;height:72px;border-radius:50%;
+            background:{bg};border:1.5px solid {border};text-align:center;gap:2px">
+  <div style="font-size:1rem;font-weight:600;color:{color};line-height:1">{value}</div>
+  <div style="font-size:9px;color:#888;text-transform:uppercase;letter-spacing:.04em;margin-top:2px">{label}</div>
 </div>"""
 
 # ── Page setup ────────────────────────────────────────────────────────────────
@@ -235,16 +308,12 @@ st.markdown("""<style>
                                    letter-spacing:.05em; color:#888; }
   [data-testid="stMetricValue"]  { font-size:1.55rem!important; }
   [data-testid="stMetricDelta"]  { font-size:.78rem!important; }
-  .day-divider {
-    border-left: 4px solid #378ADD;
-    padding-left: 0.75rem;
-    margin: 1.5rem 0 0.25rem;
-  }
 </style>""", unsafe_allow_html=True)
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("⚙️  Settings")
+    page   = st.radio("Page", ["📅  Daily View", "📊  Analysis"])
     source = st.radio("Data source", ["🔴  Live (DynamoDB)", "📁  CSV file"])
 
     tz_offset = st.number_input("UTC offset (hours)", value=5,
@@ -263,6 +332,10 @@ with st.sidebar:
 
     if "Live" in source:
         st.divider()
+        if st.button("🔄 Refresh data"):
+            st.session_state.pop("df_cache", None)
+            fetch_dynamodb.clear()
+            st.rerun()
         auto_refresh = st.toggle("Auto-refresh", value=False)
         if auto_refresh:
             refresh_min = st.slider("Refresh every (minutes)", 1, 30, 2)
@@ -274,13 +347,16 @@ with st.sidebar:
 df = pd.DataFrame()
 
 if "Live" in source:
-    with st.spinner("Fetching from DynamoDB…"):
-        try:
-            df = fetch_dynamodb()
-            st.sidebar.caption(f"Last fetched: {datetime.now().strftime('%H:%M:%S')}")
-        except Exception as exc:
-            st.error(f"DynamoDB error: {exc}")
-            st.stop()
+    if "df_cache" not in st.session_state:
+        with st.spinner("Fetching from DynamoDB…"):
+            try:
+                st.session_state.df_cache       = fetch_dynamodb()
+                st.session_state.last_fetched   = datetime.now().strftime('%H:%M:%S')
+            except Exception as exc:
+                st.error(f"DynamoDB error: {exc}")
+                st.stop()
+    df = st.session_state.df_cache
+    st.sidebar.caption(f"Last fetched: {st.session_state.get('last_fetched', '—')}")
 else:
     if uploaded is None:
         st.info("📁  Upload a CSV file in the sidebar to view the dashboard.")
@@ -302,123 +378,174 @@ df["date_local"] = df["ts_local"].dt.date
 days             = sorted(df["date_local"].unique())
 total_all        = len(df)
 
-# ── Page header ───────────────────────────────────────────────────────────────
-st.title("CO₂ Office Air Quality Dashboard")
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 1 — DAILY VIEW
+# ══════════════════════════════════════════════════════════════════════════════
+if "Daily" in page:
+    st.title("CO₂ Office Air Quality Dashboard")
 
-date_range = (
-    df["ts_local"].iloc[0].strftime("%B %d, %Y")
-    if len(days) == 1
-    else f"{df['ts_local'].iloc[0].strftime('%B %d, %Y')} – "
-         f"{df['ts_local'].iloc[-1].strftime('%B %d, %Y')}"
-)
-st.caption(
-    f"{date_range}  ·  {tz_label}  ·  "
-    f"{total_all} readings across {len(days)} day(s)"
-    + (f"  ·  {removed} zero readings excluded" if removed else "")
-)
-
-# ── Per-day sections ──────────────────────────────────────────────────────────
-for day_date in days:
-    day_df   = df[df["date_local"] == day_date].copy()
-    day_name = DAYS[pd.Timestamp(day_date).weekday()]
-    total    = len(day_df)
-
-    mean_ppm  = round(day_df["co2_ppm"].mean())
-    max_idx   = day_df["co2_ppm"].idxmax()
-    min_idx   = day_df["co2_ppm"].idxmin()
-    latest    = day_df.iloc[-1]
-    duration  = (day_df["ts_local"].iloc[-1] - day_df["ts_local"].iloc[0]).total_seconds() / 3600
-    counts    = level_counts(day_df)
-    pcts      = {k: round(v / total * 100) if total else 0 for k, v in counts.items()}
-
-    hour          = day_df["ts_local"].dt.hour
-    office_df     = day_df[(hour >= office_start) & (hour < office_end)]
-    non_office_df = day_df[(hour < office_start)  | (hour >= office_end)]
-    oc            = level_counts(office_df)
-    noc           = level_counts(non_office_df)
-    oc_total      = sum(oc.values())
-    noc_total     = sum(noc.values())
-
-    st.markdown(
-        f'<div class="day-divider">'
-        f'<h2 style="margin:0;font-size:1.15rem;font-weight:700;">'
-        f'{day_name} · {day_date.strftime("%B %d, %Y")}</h2>'
-        f'<p style="margin:2px 0 0;font-size:0.8rem;color:#888;">'
-        f'{day_df["ts_local"].iloc[0].strftime("%I:%M %p").lstrip("0")} – '
-        f'{day_df["ts_local"].iloc[-1].strftime("%I:%M %p").lstrip("0")} {tz_label}'
-        f' · {total} readings over {duration:.1f} h</p>'
-        f'</div>',
-        unsafe_allow_html=True,
+    date_range = (
+        df["ts_local"].iloc[0].strftime("%B %d, %Y")
+        if len(days) == 1
+        else f"{df['ts_local'].iloc[0].strftime('%B %d, %Y')} – "
+             f"{df['ts_local'].iloc[-1].strftime('%B %d, %Y')}"
+    )
+    st.caption(
+        f"{date_range}  ·  {tz_label}  ·  "
+        f"{total_all} readings across {len(days)} day(s)"
+        + (f"  ·  {removed} zero readings excluded" if removed else "")
     )
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Average CO₂",   f"{mean_ppm} ppm")
-    c2.metric("Peak CO₂",
-              f"{day_df.loc[max_idx, 'co2_ppm']} ppm",
-              f"at {day_df.loc[max_idx, 'ts_local'].strftime('%I:%M %p').lstrip('0')}")
-    c3.metric("Minimum CO₂",
-              f"{day_df.loc[min_idx, 'co2_ppm']} ppm",
-              f"at {day_df.loc[min_idx, 'ts_local'].strftime('%I:%M %p').lstrip('0')}")
-    c4.metric("Latest Reading",
-              f"{int(latest['co2_ppm'])} ppm",
-              classify(int(latest["co2_ppm"])))
+    for day_date in days:
+        day_df   = df[df["date_local"] == day_date].copy()
+        day_name = DAYS[pd.Timestamp(day_date).weekday()]
+        total    = len(day_df)
+
+        mean_ppm = round(day_df["co2_ppm"].mean())
+        max_ppm  = int(day_df["co2_ppm"].max())
+        min_ppm  = int(day_df["co2_ppm"].min())
+        duration = (day_df["ts_local"].iloc[-1] - day_df["ts_local"].iloc[0]).total_seconds() / 3600
+
+        hour          = day_df["ts_local"].dt.hour
+        office_df     = day_df[(hour >= office_start) & (hour < office_end)]
+        non_office_df = day_df[(hour < office_start)  | (hour >= office_end)]
+        oc  = level_counts(office_df)
+        noc = level_counts(non_office_df)
+
+        st.markdown(f"""
+<div style="display:flex;align-items:center;justify-content:space-between;
+            background:linear-gradient(135deg,#e8f1fb,#dbeafe);
+            border-left:4px solid #378ADD;
+            border-radius:12px;padding:1rem 1.5rem;margin-bottom:.75rem">
+  <div>
+    <div style="font-size:1rem;font-weight:600;color:#1e293b">
+      {day_name}
+      <span style="font-weight:400;color:#64748b;font-size:.9rem">
+        &nbsp;{pd.Timestamp(day_date).strftime("%B %d, %Y")}
+      </span>
+    </div>
+    <div style="font-size:12px;color:#94a3b8;margin-top:3px">
+      {day_df["ts_local"].iloc[0].strftime("%I:%M %p").lstrip("0")} –
+      {day_df["ts_local"].iloc[-1].strftime("%I:%M %p").lstrip("0")} {tz_label}
+      &nbsp;·&nbsp; {total} readings &nbsp;·&nbsp; {duration:.1f} h
+    </div>
+  </div>
+  <div style="display:flex;gap:10px">
+    {bubble_html(mean_ppm, "Average")}
+    {bubble_html(max_ppm,  "Peak")}
+    {bubble_html(min_ppm,  "Min")}
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+        col_line, col_pies = st.columns([3, 1.2])
+
+        with col_line:
+            st.plotly_chart(line_chart(day_df, tz_offset),
+                            use_container_width=True, key=f"line_{day_date}")
+
+        with col_pies:
+            st.plotly_chart(
+                pie_chart(oc,  f"☀️ Office ({office_start:02d}:00–{office_end:02d}:00)"),
+                use_container_width=True, key=f"pie_o_{day_date}"
+            )
+            st.plotly_chart(
+                pie_chart(noc, "🌙 Non-office hours"),
+                use_container_width=True, key=f"pie_n_{day_date}"
+            )
+
+        st.divider()
+
+    buf = io.StringIO()
+    df[["ts_local", "co2_ppm"]].rename(
+        columns={"ts_local": "timestamp_local", "co2_ppm": "co2_ppm"}
+    ).to_csv(buf, index=False)
+    st.download_button(
+        "⬇️  Download full CSV",
+        data=buf.getvalue(),
+        file_name=f"co2_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        mime="text/csv",
+    )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 2 — ANALYSIS
+# ══════════════════════════════════════════════════════════════════════════════
+else:
+    st.title("CO₂ Analysis")
+
+    filter_col1, filter_col2 = st.columns([2, 3])
+
+    with filter_col1:
+        period = st.selectbox("Period", ["Weekly", "Monthly", "Yearly", "Custom range"])
+
+    with filter_col2:
+        if period == "Custom range":
+            date_from, date_to = st.date_input(
+                "Date range",
+                value=(df["date_local"].min(), df["date_local"].max()),
+                min_value=df["date_local"].min(),
+                max_value=df["date_local"].max(),
+            )
+        else:
+            last_date = df["date_local"].max()
+            last_ts   = pd.Timestamp(last_date)
+            if period == "Weekly":
+                date_from = (last_ts - pd.Timedelta(days=6)).date()
+            elif period == "Monthly":
+                date_from = (last_ts - pd.DateOffset(months=1)).date()
+            else:
+                date_from = (last_ts - pd.DateOffset(years=1)).date()
+            date_to = last_date
+            st.caption(f"Showing: {date_from} → {date_to}")
+
+    ana_df = df[
+        (df["date_local"] >= date_from) &
+        (df["date_local"] <= date_to)
+    ].copy()
+
+    if ana_df.empty:
+        st.warning("No data for selected period.")
+        st.stop()
+
+    total_ana  = len(ana_df)
+    counts_ana = level_counts(ana_df)
+    pct        = lambda v: round(v / total_ana * 100) if total_ana else 0
+
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Average CO₂",   f"{round(ana_df['co2_ppm'].mean())} ppm")
+    c2.metric("Peak CO₂",      f"{int(ana_df['co2_ppm'].max())} ppm")
+    c3.metric("Minimum CO₂",   f"{int(ana_df['co2_ppm'].min())} ppm")
+    c4.metric("Good",          f"{pct(counts_ana['Good'])}%",
+              f"{counts_ana['Good']} readings")
+    c5.metric("Moderate",      f"{pct(counts_ana['Moderate'])}%",
+              f"{counts_ana['Moderate']} readings")
+    c6.metric("High / Elevated",
+              f"{pct(counts_ana['Elevated'] + counts_ana['High'])}%",
+              f"{counts_ana['Elevated'] + counts_ana['High']} readings")
 
     st.write("")
 
-    st.subheader("CO₂ Trend Over Time")
-    st.plotly_chart(line_chart(day_df, tz_offset), use_container_width=True,
-                    key=f"line_{day_date}")
+    ch1, ch2 = st.columns(2)
 
-    col_l, col_r = st.columns(2)
-    with col_l:
-        st.subheader("Air Quality Level Breakdown")
-        for name, rng, bg, border in CARD_META:
-            st.markdown(
-                level_card_html(name, rng, counts[name], pcts[name], bg, border),
-                unsafe_allow_html=True,
-            )
-    with col_r:
-        st.subheader("Readings per Level")
-        st.plotly_chart(bar_chart(counts), use_container_width=True,
-                        key=f"bar_{day_date}")
+    with ch1:
+        st.subheader("Average CO₂ per day")
+        daily_avg = ana_df.groupby("date_local")["co2_ppm"].mean().round()
+        st.plotly_chart(analysis_line_chart(daily_avg),
+                        use_container_width=True, key="ana_line")
 
-    pie_l, pie_r = st.columns(2)
-    with pie_l:
-        st.plotly_chart(
-            pie_chart(oc, f"☀️ Office Hours  ({office_start:02d}:00–{office_end:02d}:00)  ·  {oc_total} readings"),
-            use_container_width=True, key=f"pie_office_{day_date}",
-        )
-    with pie_r:
-        st.plotly_chart(
-            pie_chart(noc, f"🌙 Non-Office Hours  ·  {noc_total} readings"),
-            use_container_width=True, key=f"pie_non_{day_date}",
-        )
+    with ch2:
+        st.subheader("Level distribution")
+        st.plotly_chart(analysis_pie_chart(counts_ana),
+                        use_container_width=True, key="ana_pie")
 
-    with st.expander("Show raw data for this day"):
-        st.dataframe(
-            day_df[["ts_local", "co2_ppm"]].rename(
-                columns={"ts_local": f"Timestamp ({tz_label})", "co2_ppm": "CO₂ (ppm)"}
-            ),
-            use_container_width=True,
-        )
+    st.subheader("Readings per level")
+    st.plotly_chart(analysis_bar_chart(counts_ana),
+                    use_container_width=True, key="ana_bar")
 
-    st.divider()
-
-# ── Download ──────────────────────────────────────────────────────────────────
-buf = io.StringIO()
-df[["ts_local", "co2_ppm"]].rename(
-    columns={"ts_local": "timestamp_local", "co2_ppm": "co2_ppm"}
-).to_csv(buf, index=False)
-
-st.download_button(
-    "⬇️  Download full CSV",
-    data=buf.getvalue(),
-    file_name=f"co2_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-    mime="text/csv",
-)
 
 # ── Auto-refresh ──────────────────────────────────────────────────────────────
 if auto_refresh:
     time.sleep(refresh_min * 60)
+    st.session_state.pop("df_cache", None)
     fetch_dynamodb.clear()
     st.rerun()
