@@ -375,7 +375,7 @@ if df.empty:
 
 df["ts_local"]   = df["timestamp_utc"] + pd.Timedelta(hours=tz_offset)
 df["date_local"] = df["ts_local"].dt.date
-days             = sorted(df["date_local"].unique())
+days             = sorted(df["date_local"].unique(), reverse=True)
 total_all        = len(df)
 
 # ══════════════════════════════════════════════════════════════════════════════
