@@ -74,7 +74,7 @@ def parse_ts(ts_val) -> datetime:
     return datetime.fromtimestamp(ts, tz=timezone.utc)
 
 # ── Data ──────────────────────────────────────────────────────────────────────
-@st.cache_data(ttl=None)
+@st.cache_data(ttl=3600)
 def fetch_dynamodb() -> pd.DataFrame:
     ddb = boto3.resource(
         "dynamodb",
@@ -214,8 +214,10 @@ def analysis_pie_chart(counts: dict) -> go.Figure:
     )
     return fig
 
-def analysis_line_chart(daily_avg: pd.Series) -> go.Figure:
+def analysis_line_chart(daily_avg: pd.Series, tickvals=None, ticktext=None,
+                         hover_labels=None) -> go.Figure:
     vals  = daily_avg.values
+    x_pos = list(range(len(vals)))
     y_min = max(300, (int(min(vals)) // 50) * 50 - 50)
     y_max = (int(max(vals)) // 50) * 50 + 100
 
@@ -242,7 +244,7 @@ def analysis_line_chart(daily_avg: pd.Series) -> go.Figure:
             )
 
     fig.add_trace(go.Scatter(
-        x=daily_avg.index.astype(str),
+        x=x_pos,
         y=vals,
         mode="lines+markers",
         line=dict(color="#2c3e50", width=2),
@@ -251,15 +253,20 @@ def analysis_line_chart(daily_avg: pd.Series) -> go.Figure:
             size=8,
             line=dict(color="white", width=1.5),
         ),
-        hovertemplate="%{x}<br><b>%{y} ppm</b><extra></extra>",
+        customdata=hover_labels if hover_labels is not None else x_pos,
+        hovertemplate="%{customdata}<br><b>%{y} ppm</b><extra></extra>",
     ))
+
+    xaxis_cfg = dict(showgrid=True, gridcolor="#f0f0f0")
+    if tickvals is not None:
+        xaxis_cfg.update(tickmode="array", tickvals=tickvals, ticktext=ticktext)
 
     fig.update_layout(
         height=280,
         margin=dict(l=0, r=80, t=10, b=0),
         paper_bgcolor="white", plot_bgcolor="white",
         showlegend=False,
-        xaxis=dict(showgrid=True, gridcolor="#f0f0f0"),
+        xaxis=xaxis_cfg,
         yaxis=dict(showgrid=True, gridcolor="#f0f0f0",
                    ticksuffix=" ppm", range=[y_min, y_max]),
     )
@@ -490,7 +497,8 @@ else:
             last_date = df["date_local"].max()
             last_ts   = pd.Timestamp(last_date)
             if period == "Weekly":
-                date_from = (last_ts - pd.Timedelta(days=6)).date()
+                days_since_sunday = (last_ts.weekday() + 1) % 7
+                date_from = (last_ts - pd.Timedelta(days=days_since_sunday)).date()
             elif period == "Monthly":
                 date_from = (last_ts - pd.DateOffset(months=1)).date()
             else:
@@ -502,6 +510,11 @@ else:
         (df["date_local"] >= date_from) &
         (df["date_local"] <= date_to)
     ].copy()
+
+    ana_hour = ana_df["ts_local"].dt.hour
+    ana_df = ana_df[(ana_hour >= office_start) & (ana_hour < office_end)]
+
+    st.caption(f"☀️ Office hours only · {office_start:02d}:00–{office_end:02d}:00")
 
     if ana_df.empty:
         st.warning("No data for selected period.")
@@ -528,10 +541,28 @@ else:
     ch1, ch2 = st.columns(2)
 
     with ch1:
-        st.subheader("Average CO₂ per day")
-        daily_avg = ana_df.groupby("date_local")["co2_ppm"].mean().round()
-        st.plotly_chart(analysis_line_chart(daily_avg),
-                        use_container_width=True, key="ana_line")
+        st.subheader("Average CO₂ trend")
+        seg_span  = max(office_end - office_start, 1)
+        seg_size  = seg_span / 3
+        seg_names = ["AM", "Mid", "PM"]
+
+        ana_df["hour"]    = ana_df["ts_local"].dt.hour
+        ana_df["segment"] = ((ana_df["hour"] - office_start) // seg_size).clip(upper=2).astype(int)
+
+        daily_avg = ana_df.groupby(["date_local", "segment"])["co2_ppm"].mean().round()
+
+        tickvals, ticktext, hover_labels = [], [], []
+        for i, (d, s) in enumerate(daily_avg.index):
+            day_label = pd.Timestamp(d).strftime("%a %d")
+            hover_labels.append(f"{day_label} · {seg_names[s]}")
+            if s == 0:
+                tickvals.append(i)
+                ticktext.append(day_label)
+
+        st.plotly_chart(
+            analysis_line_chart(daily_avg, tickvals, ticktext, hover_labels),
+            use_container_width=True, key="ana_line"
+        )
 
     with ch2:
         st.subheader("Level distribution")
